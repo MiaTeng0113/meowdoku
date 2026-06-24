@@ -148,7 +148,7 @@ button { border: 0; cursor: pointer; color: inherit; }
 .rule-tags span { display: flex; align-items: center; justify-content: center; min-height: 34px; padding: 5px; border-radius: 10px; background: rgba(255,255,255,.72); font-size: 12px; text-align: center; font-weight: 740; color: #7d5d50; }
 
 .board-wrap { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; margin: 4px 0 8px; }
-.board {
+.board { touch-action: none; user-select: none; -webkit-user-select: none;
   width: min(100%, 394px, calc(100dvh - 290px));
   max-width: 100%;
   aspect-ratio: 1;
@@ -802,6 +802,10 @@ body[data-bg-theme="sakura"] {
 }
 .home .logo-wrap { margin-top: 4px; }
 
+
+.cell.dragging { outline: 3px solid rgba(255, 255, 255, .95); box-shadow: 0 0 0 4px rgba(244,163,38,.65), inset 0 -2px 0 rgba(0,0,0,.05); }
+.cell-overlay.mouse img { animation: mouseHop .28s ease-in-out infinite alternate; }
+@keyframes mouseHop { from { transform: translateY(0) scale(1); } to { transform: translateY(-5px) scale(1.06); } }
 </style>
 </head>
 <body>
@@ -2357,6 +2361,18 @@ const state = {
 
 const SINGLE_TAP_DELAY = 250;
 const tapTimers = new Map();
+let dragMark = {
+  active: false,
+  mode: 2,
+  pointerId: null,
+  started: false,
+  startX: 0,
+  startY: 0,
+  touched: new Set(),
+  suppressClick: false,
+  undoPushed: false,
+  changed: 0,
+};
 
 function clearTapTimers() {
   tapTimers.forEach(timer => window.clearTimeout(timer));
@@ -2611,6 +2627,7 @@ function renderCellContent(r, c, value) {
 
 function renderGame() {
   clearTapTimers();
+  resetDragMark();
   const l = level();
   if (!state.board.length) state.board = blankBoard(l.size);
   const cells = [];
@@ -2663,7 +2680,7 @@ function renderGame() {
         <button class="item-btn" id="mouseBtn" aria-label="老鼠提示">
           <span class="circle">${toolButtonImage(TOOL_MOUSE_SRC, '老鼠')}</span>
           <span class="label">老鼠</span>
-          <span class="sub">猫咪埋伏在十字路上</span>
+          <span class="sub">老鼠会走没有猫的路径逃跑</span>
         </button>
       </div>
       <div class="utility-row" role="toolbar" aria-label="功能栏">
@@ -2677,8 +2694,23 @@ function renderGame() {
     </section>`;
 
   document.querySelectorAll('.cell').forEach(cell => {
+    cell.addEventListener('pointerdown', e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      beginDragMark(e, cell);
+    });
+    cell.addEventListener('pointermove', e => {
+      if (!dragMark.active || dragMark.pointerId !== e.pointerId) return;
+      e.preventDefault();
+      maybeStartDragMark(e, cell);
+    });
+    cell.addEventListener('pointerup', endDragMark);
+    cell.addEventListener('pointercancel', endDragMark);
     cell.addEventListener('click', e => {
       e.preventDefault();
+      if (dragMark.suppressClick) {
+        dragMark.suppressClick = false;
+        return;
+      }
       handleCellTap(Number(cell.dataset.r), Number(cell.dataset.c));
     });
     cell.addEventListener('dblclick', e => e.preventDefault());
@@ -2703,6 +2735,89 @@ function renderGame() {
   startTimer();
   exposeDebugApi();
 }
+
+
+function canDragMarkCell(r, c) {
+  if (state.gameOver || state.toolBusy) return false;
+  if (!state.board[r]) return false;
+  const value = state.board[r][c];
+  if (value !== 0 && value !== 2) return false;
+  return !getToolAnchorKeys().has(keyOf(r, c));
+}
+
+function resetDragMark() {
+  document.querySelectorAll('.cell.dragging').forEach(el => el.classList.remove('dragging'));
+  dragMark.active = false;
+  dragMark.started = false;
+  dragMark.pointerId = null;
+  dragMark.touched.clear();
+  dragMark.undoPushed = false;
+  dragMark.changed = 0;
+}
+
+function beginDragMark(e, cell) {
+  const r = Number(cell.dataset.r);
+  const c = Number(cell.dataset.c);
+  if (!canDragMarkCell(r, c)) return;
+  dragMark.active = true;
+  dragMark.started = false;
+  dragMark.pointerId = e.pointerId;
+  dragMark.startX = e.clientX;
+  dragMark.startY = e.clientY;
+  dragMark.mode = state.board[r][c] === 2 ? 0 : 2;
+  dragMark.touched = new Set();
+  dragMark.undoPushed = false;
+  dragMark.changed = 0;
+}
+
+function applyDragMarkToCell(cell) {
+  if (!cell || !cell.classList || !cell.classList.contains('cell')) return;
+  const r = Number(cell.dataset.r);
+  const c = Number(cell.dataset.c);
+  const k = keyOf(r, c);
+  if (dragMark.touched.has(k) || !canDragMarkCell(r, c)) return;
+  dragMark.touched.add(k);
+  cell.classList.add('dragging');
+  if (!dragMark.undoPushed) {
+    pushUndo();
+    dragMark.undoPushed = true;
+  }
+  if (state.board[r][c] !== dragMark.mode) {
+    state.board[r][c] = dragMark.mode;
+    dragMark.changed++;
+    playClick();
+    paintBoard();
+  }
+}
+
+function maybeStartDragMark(e, startCell) {
+  if (!dragMark.active || dragMark.pointerId !== e.pointerId) return;
+  const moved = Math.hypot(e.clientX - dragMark.startX, e.clientY - dragMark.startY);
+  if (!dragMark.started && moved < 8) return;
+  if (!dragMark.started) {
+    dragMark.started = true;
+    dragMark.suppressClick = true;
+    clearTapTimers();
+    applyDragMarkToCell(startCell);
+  }
+  const el = document.elementFromPoint(e.clientX, e.clientY);
+  const cell = el && el.closest ? el.closest('.cell') : null;
+  applyDragMarkToCell(cell);
+}
+
+function endDragMark(e) {
+  if (!dragMark.active || dragMark.pointerId !== e.pointerId) return;
+  if (dragMark.started) {
+    if (dragMark.changed > 0) {
+      state.moves++;
+      paintBoard();
+    } else if (dragMark.undoPushed) {
+      state.undo.pop();
+    }
+  }
+  resetDragMark();
+}
+
 
 function handleCellTap(r, c) {
   if (state.gameOver) return;
@@ -3009,46 +3124,78 @@ function useCanTool() {
   }, 1000);
 }
 
-function useMouseTool() {
-  if (state.gameOver || state.toolBusy) return;
-  const targets = getUnfoundCats();
-  if (!targets.length) return toolUnavailable();
-  const shuffledTargets = [...targets].sort(() => Math.random() - 0.5);
+function isSafeEmptyCell(pt) {
+  if (!pt || !state.board[pt.r]) return false;
+  if (state.board[pt.r][pt.c] !== 0) return false;
+  if (level().solution[pt.r] === pt.c) return false;
+  return !getToolAnchorKeys().has(keyOf(pt.r, pt.c));
+}
+
+function mouseNeighbors(pt) {
   const n = level().size;
-  let cat = null;
-  let pool = [];
-  for (const candidate of shuffledTargets) {
-    const options = [];
-    for (let c = 0; c < n; c++) options.push({ r: candidate.r, c });
-    for (let r = 0; r < n; r++) options.push({ r, c: candidate.c });
-    const available = options.filter(pt => !(pt.r === candidate.r && pt.c === candidate.c)).filter(canPlaceToolAnchor);
-    if (available.length) {
-      cat = candidate;
-      pool = available;
-      break;
+  const arr = [];
+  for (let dr = -1; dr <= 1; dr++) {
+    for (let dc = -1; dc <= 1; dc++) {
+      if (!dr && !dc) continue;
+      const rr = pt.r + dr;
+      const cc = pt.c + dc;
+      if (rr >= 0 && rr < n && cc >= 0 && cc < n) arr.push({ r: rr, c: cc });
     }
   }
-  if (!cat || !pool.length) return toolUnavailable();
-  const anchor = pool[Math.floor(Math.random() * pool.length)];
-  const anchorKey = keyOf(anchor.r, anchor.c);
-  const lineKeys = [];
-  for (let c = 0; c < n; c++) {
-    const k = keyOf(anchor.r, c);
-    if (k !== anchorKey && !(state.board[anchor.r][c] === 1)) lineKeys.push(k);
-  }
+  return arr;
+}
+
+function findMouseEscapePath() {
+  const n = level().size;
+  const safe = [];
   for (let r = 0; r < n; r++) {
-    const k = keyOf(r, anchor.c);
-    if (k !== anchorKey && !(state.board[r][anchor.c] === 1)) lineKeys.push(k);
+    for (let c = 0; c < n; c++) {
+      const pt = { r, c };
+      if (isSafeEmptyCell(pt)) safe.push(pt);
+    }
   }
+  if (safe.length < 3) return null;
+  const shuffled = [...safe].sort(() => Math.random() - 0.5);
+  for (const start of shuffled) {
+    const startKey = keyOf(start.r, start.c);
+    const seconds = mouseNeighbors(start).filter(isSafeEmptyCell).filter(pt => keyOf(pt.r, pt.c) !== startKey).sort(() => Math.random() - 0.5);
+    for (const second of seconds) {
+      const used = new Set([startKey, keyOf(second.r, second.c)]);
+      const thirds = mouseNeighbors(second).filter(isSafeEmptyCell).filter(pt => !used.has(keyOf(pt.r, pt.c))).sort(() => Math.random() - 0.5);
+      if (thirds.length) return [start, second, thirds[0]];
+    }
+  }
+  return null;
+}
+
+function useMouseTool() {
+  if (state.gameOver || state.toolBusy) return;
+  const path = findMouseEscapePath();
+  if (!path) return toolUnavailable();
+
+  state.toolBusy = true;
   state.toolUses.mouse++;
-  const hint = { anchor, lineKeys: [...new Set(lineKeys)] };
-  state.mouseHints.push(hint);
+  pushUndo();
   playClick();
-  paintBoard();
+
+  const hint = { anchor: path[0], lineKeys: [] };
+  state.mouseHints.push(hint);
+
+  path.forEach((pt, index) => {
+    window.setTimeout(() => {
+      hint.anchor = pt;
+      if (state.board[pt.r][pt.c] === 0) state.board[pt.r][pt.c] = 2;
+      paintBoard(new Set(), keyOf(pt.r, pt.c));
+      playClick();
+    }, index * 260);
+  });
+
   window.setTimeout(() => {
-    hint.lineKeys = [];
+    state.mouseHints = (state.mouseHints || []).filter(x => x !== hint);
+    state.moves++;
+    state.toolBusy = false;
     paintBoard();
-  }, 1000);
+  }, path.length * 260 + 160);
 }
 
 function fillSmartMarks() {
